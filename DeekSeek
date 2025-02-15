@@ -1,0 +1,175 @@
+//Here's the refactored code for the ESP32 A1S board with Bluetooth audio streaming and secure webhook integration: FROM DEEPSEEK
+
+
+#include <MFRC522.h>
+#include <SD.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include "esp_bt.h"
+#include "BluetoothA2DPSource.h"
+#include <helix_mp3_decoder.h>
+
+// Libraries used:
+// - MFRC522: https://github.com/miguelbalboa/rfid
+// - SD: Built-in Arduino SD library
+// - ESP32-A2DP: https://github.com/pschatzmann/ESP32-A2DP
+// - Helix MP3 Decoder: https://github.com/pschatzmann/arduino-helix
+
+// Hardware Configuration
+#define SD_CS_PIN         15
+#define RFID_SS_PIN       5
+#define RFID_RST_PIN      4
+#define VOLUME_PIN        A0
+
+// WiFi Credentials
+const char* ssid = "YOUR_SSID";
+const char* password = "YOUR_PASSWORD";
+
+// Webhook Configuration
+const char* webhook_host = "hook.eu2.make.com";
+const char* webhook_path = "/pe7n6h0cpbuio3vcs9vugd93l1p2s4aw";
+
+// Audio Configuration
+BluetoothA2DPSource a2dp_source;
+Helix_MP3_Decoder mp3_decoder;
+const int audio_buffer_size = 1024;
+uint8_t* audio_buffer;
+File current_mp3_file;
+float volume = 1.0; // 0.0-1.0
+
+struct UserData {
+  String parentName;
+  String childName;
+  String phoneNumber;
+  String studentNumber;
+  String cardUID;
+};
+
+MFRC522 mfrc522(RFID_SS_PIN, RFID_RST_PIN);
+UserData currentUser;
+WiFiClientSecure client;
+
+void setup() {
+  Serial.begin(115200);
+  initSDCard();
+  initRFID();
+  initBluetooth();
+  connectWiFi();
+}
+
+void loop() {
+  handleRFID();
+  handleVolume();
+  // Add button handling as needed
+}
+
+// Hardware Initialization
+void initSDCard() {
+  SPI.begin(14, 12, 13, SD_CS_PIN);
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD Card initialization failed!");
+    while(true);
+  }
+}
+
+void initRFID() {
+  SPI.begin();
+  mfrc522.PCD_Init();
+}
+
+void initBluetooth() {
+  a2dp_source.start("ESP32-Speaker");
+  a2dp_source.set_volume(100);
+  a2dp_source.set_avrc_metadata_attribute(ESP_AVRC_MD_ATTR_TITLE);
+  audio_buffer = (uint8_t*)malloc(audio_buffer_size);
+}
+
+void connectWiFi() {
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  client.setInsecure(); // For simplified SSL (consider proper certs for production)
+}
+
+// Audio Playback
+void playMP3(String filename) {
+  if (current_mp3_file) current_mp3_file.close();
+  
+  current_mp3_file = SD.open(filename);
+  if (!current_mp3_file) {
+    Serial.println("Error opening MP3 file");
+    return;
+  }
+
+  mp3_decoder.begin();
+  a2dp_source.set_stream_reader(read_data_callback, false);
+}
+
+void read_data_callback(const uint8_t *data, uint32_t len) {
+  static size_t mp3_offset = 0;
+  if (current_mp3_file.available()) {
+    size_t bytes_read = current_mp3_file.read(audio_buffer, audio_buffer_size);
+    size_t pcm_size = mp3_decoder.decode(audio_buffer, bytes_read);
+    
+    // Apply volume
+    for (int i = 0; i < pcm_size; i += 2) {
+      int16_t sample = (audio_buffer[i+1] << 8) | audio_buffer[i];
+      sample *= volume;
+      audio_buffer[i] = sample & 0xFF;
+      audio_buffer[i+1] = (sample >> 8) & 0xFF;
+    }
+    
+    a2dp_source.write_data(audio_buffer, pcm_size);
+  }
+}
+
+// RFID Handling
+void handleRFID() {
+  if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) return;
+
+  readCardData();
+  sendWebhook();
+  playMP3("/" + currentUser.studentNumber + ".mp3");
+  
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+}
+
+void readCardData() {
+  MFRC522::MIFARE_Key key = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  
+  currentUser.studentNumber = readBlock(1, key);
+  currentUser.parentName = readBlock(5, key);
+  currentUser.childName = readBlock(6, key);
+  currentUser.phoneNumber = readBlock(4, key);
+  currentUser.cardUID = getRFIDUID();
+}
+
+// Webhook Communication
+void sendWebhook() {
+  if (!client.connect(webhook_host, 443)) {
+    Serial.println("Connection to webhook failed");
+    return;
+  }
+
+  String query = "ChildName=" + urlEncode(currentUser.childName) +
+                "&ParentName=" + urlEncode(currentUser.parentName) +
+                "&ParentPhone=" + urlEncode(currentUser.phoneNumber) +
+                "&StudentNumber=" + urlEncode(currentUser.studentNumber) +
+                "&CardUID=" + urlEncode(currentUser.cardUID);
+
+  client.print(String("GET ") + webhook_path + "?" + query + " HTTP/1.1\r\n" +
+               "Host: " + webhook_host + "\r\n" +
+               "Connection: close\r\n\r\n");
+}
+
+// Helper Functions (keep previous implementations for:
+// readBlock(), parseData(), getRFIDUID(), urlEncode())
+// ...
+
+void handleVolume() {
+  int raw = analogRead(VOLUME_PIN);
+  volume = map(raw, 0, 4095, 0, 100) / 100.0; // ESP32 has 12-bit ADC
+}
