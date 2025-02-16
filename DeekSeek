@@ -165,9 +165,98 @@ void sendWebhook() {
                "Connection: close\r\n\r\n");
 }
 
-// Helper Functions (keep previous implementations for:
-// readBlock(), parseData(), getRFIDUID(), urlEncode())
-// ...
+
+// New helper function to read any block
+String readBlock(byte block, MFRC522::MIFARE_Key key) {
+  byte retry = MAX_RETRIES;
+  byte buffer[18];
+  byte len = 18;
+
+  while (retry--) {
+    MFRC522::StatusCode status = mfrc522.PCD_Authenticate(
+      MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(mfrc522.uid));
+      
+    if (status != MFRC522::STATUS_OK) {
+      Serial.print(F("Auth failed Block "));
+      Serial.print(block);
+      Serial.print(": ");
+      Serial.println(mfrc522.GetStatusCodeName(status));
+      continue;
+    }
+
+    status = mfrc522.MIFARE_Read(block, buffer, &len);
+    if (status == MFRC522::STATUS_OK) {
+      return parseData(buffer);
+    }
+  }
+  return "";
+}
+
+// Data parser with trimming (fixed)
+String parseData(byte* buffer) {
+  String result = "";
+  for (uint8_t i = 0; i < 16; i++) {
+    if (buffer[i] == 0 || buffer[i] == ' ') break;
+    result += (char)buffer[i];
+  }
+  result.trim();  // Trim the string in-place
+  return result;   // Return the modified string
+}
+
+// New function to get RFID UID as string
+String getRFIDUID() {
+  String uidString = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    uidString += String(mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
+    uidString += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  return uidString;
+}
+
+// Updated URL constructor with new parameters
+String constructWebhookURL(const UserData& data) {
+  const String baseURL = "https://hook.eu2.make.com/pe7n6h0cpbuio3vcs9vugd93l1p2s4aw";
+  String url = baseURL + "?";
+  
+  // Original parameters
+  url += "ChildName=" + urlEncode(data.childName);
+  url += "&ParentName=" + urlEncode(data.parentName);
+  url += "&ParentPhone=" + urlEncode(data.phoneNumber);
+  url += "&StudentNumber=" + urlEncode(data.studentNumber);
+  url += "&CardUID=" + urlEncode(data.cardUID);
+
+  return url;
+}
+
+// URL encoding function (replaces JSON escaping)
+String urlEncode(const String& input) {
+  String encoded = "";
+  const char* chars = input.c_str();
+  
+  for (unsigned int i = 0; i < input.length(); i++) {
+    char c = chars[i];
+    
+    // Keep alphanumeric and safe characters unchanged
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += c;
+    }
+    // Encode spaces as %20
+    else if (c == ' ') {
+      encoded += "%20";
+    }
+    // Encode '+' as %2B for phone numbers
+    else if (c == '+') {
+      encoded += "%2B";
+    }
+    // Encode other special characters
+    else {
+      char buf[4];
+      sprintf(buf, "%%%02X", c);
+      encoded += buf;
+    }
+  }
+  return encoded;
+}
 
 void handleVolume() {
   int raw = analogRead(VOLUME_PIN);
