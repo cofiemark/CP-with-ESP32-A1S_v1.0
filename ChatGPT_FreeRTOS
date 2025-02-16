@@ -1,0 +1,386 @@
+/**
+ * Example: Group the ESP32 A1S code into FreeRTOS tasks
+ *  - RFID Task (read card data)
+ *  - Audio Task (play MP3 via Bluetooth A2DP)
+ *  - Webhook Task (send HTTPS GET to Make.com)
+ *
+ * Dependencies (as before):
+ *   - MFRC522 by miguelbalboa
+ *   - WiFi + WiFiClientSecure (built-in to ESP32)
+ *   - ESP32-A2DP by pschatzmann: https://github.com/pschatzmann/ESP32-A2DP
+ *   - Helix MP3 or similar for decoding (if you store MP3 on SD)
+ */
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+#include <SD.h>
+#include <FS.h>
+
+#include "BluetoothA2DPSource.h"
+// #include "helix_decoder.h"  // or your chosen MP3 decode library
+
+// --------------------- CONFIG ---------------------
+const char* WIFI_SSID     = "YOUR_SSID";
+const char* WIFI_PASSWORD = "YOUR_PASSWORD";
+
+// Make.com webhook
+const String baseURL = "https://hook.eu2.make.com/pe7n6h0cpbuio3vcs9vugd93l1p2s4aw";
+
+// RFID pins (adjust for ESP32 A1S)
+#define RST_PIN  9
+#define SS_PIN   10
+
+// FreeRTOS handles
+TaskHandle_t rfidTaskHandle   = NULL;
+TaskHandle_t audioTaskHandle  = NULL;
+TaskHandle_t webhookTaskHandle= NULL;
+
+// A queue to pass "events" from RFID to other tasks
+// For example, we'll pass a struct with the user data
+#define QUEUE_LENGTH  5
+#define QUEUE_ITEM_SIZE sizeof(UserData)
+QueueHandle_t rfidQueue;
+
+// Another queue specifically for webhooks, if desired
+QueueHandle_t webhookQueue;
+
+// ---------- Data Structure ----------
+struct UserData {
+  String parentName;
+  String childName;
+  String phoneNumber;
+  String studentNumber;
+  String cardUID;
+};
+
+// ---------- Global Instances ----------
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+BluetoothA2DPSource a2dp_source;
+File mp3File;
+bool isPlaying = false;  // Track if audio is currently playing
+
+// -------------- FORWARD DECLARATIONS --------------
+void connectToWiFi();
+void sendWebhookHTTPS(const String &url);
+String constructWebhookURL(const UserData& data);
+String urlEncode(const String& input);
+
+// Tasks
+void rfidTask(void *pvParameters);
+void audioTask(void *pvParameters);
+void webhookTask(void *pvParameters);
+
+// RFID helpers
+String readBlock(byte block, MFRC522::MIFARE_Key key);
+String parseData(byte* buffer);
+String getRFIDUID();
+
+// MP3 / Bluetooth helpers
+void playMP3FromSD(const String &filename);
+void stopMP3();
+void processMP3Data(const uint8_t *data, uint32_t len);
+
+// -------------- SETUP --------------
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize SPI + RFID
+  SPI.begin();
+  mfrc522.PCD_Init();
+  Serial.println("MFRC522 initialized.");
+
+  // Connect to Wi-Fi
+  connectToWiFi();
+
+  // Initialize SD
+  if (!SD.begin()) {
+    Serial.println("SD Card Mount Failed! Check wiring for ESP32 A1S.");
+  } else {
+    Serial.println("SD card initialized.");
+  }
+
+  // Initialize Bluetooth A2DP in source mode
+  a2dp_source.set_stream_reader(processMP3Data, nullptr);
+  a2dp_source.start("ESP32_A1S_Player");
+
+  // (Optional) if your speaker requires a PIN:
+  // a2dp_source.set_pin_code("1234");
+
+  // Create queues
+  rfidQueue = xQueueCreate(QUEUE_LENGTH, QUEUE_ITEM_SIZE);
+  webhookQueue = xQueueCreate(QUEUE_LENGTH, QUEUE_ITEM_SIZE);
+
+  // Create tasks
+  xTaskCreatePinnedToCore(rfidTask,    "RFID Task",    4096, NULL, 1, &rfidTaskHandle,   1);
+  xTaskCreatePinnedToCore(audioTask,   "Audio Task",   8192, NULL, 1, &audioTaskHandle,  1);
+  xTaskCreatePinnedToCore(webhookTask, "Webhook Task", 4096, NULL, 1, &webhookTaskHandle,1);
+}
+
+void loop() {
+  // The main loop can remain empty, or do minimal background work
+  vTaskDelay(1);
+}
+
+// -------------- WIFI CONNECTION --------------
+void connectToWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.printf("Connecting to WiFi: %s\n", WIFI_SSID);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// -------------- RFID TASK --------------
+void rfidTask(void *pvParameters) {
+  while (true) {
+    // Check if a new card is present
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      MFRC522::MIFARE_Key key;
+      for (byte i = 0; i < 6; i++) key.keyByte[i] = 0xFF;
+
+      UserData user;
+      user.parentName   = readBlock(5, key);
+      user.childName    = readBlock(6, key);
+      user.phoneNumber  = readBlock(4, key);
+      user.cardUID      = getRFIDUID();
+      user.studentNumber= readBlock(1, key);
+
+      Serial.println("RFID Card Detected:");
+      Serial.println("ParentName:   " + user.parentName);
+      Serial.println("ChildName:    " + user.childName);
+      Serial.println("PhoneNumber:  " + user.phoneNumber);
+      Serial.println("StudentNumber:"+ user.studentNumber);
+      Serial.println("CardUID:      " + user.cardUID);
+
+      // Send the user data to the audio task queue (to start playback)
+      xQueueSend(rfidQueue, &user, portMAX_DELAY);
+
+      // Also send the user data to the webhook queue
+      xQueueSend(webhookQueue, &user, portMAX_DELAY);
+
+      // Halt reading
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+    }
+
+    // Small delay to prevent saturating the CPU
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+  }
+}
+
+// -------------- AUDIO TASK --------------
+void audioTask(void *pvParameters) {
+  UserData receivedUser;
+  while (true) {
+    // Wait until we receive user data from the RFID task
+    if (xQueueReceive(rfidQueue, &receivedUser, portMAX_DELAY) == pdTRUE) {
+      // If we have a valid studentNumber, build an MP3 path
+      if (receivedUser.studentNumber.length() > 0) {
+        String mp3Path = "/" + receivedUser.studentNumber + ".mp3";
+        playMP3FromSD(mp3Path);
+      }
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+// -------------- WEBHOOK TASK --------------
+void webhookTask(void *pvParameters) {
+  UserData receivedUser;
+  while (true) {
+    // Wait for user data to arrive
+    if (xQueueReceive(webhookQueue, &receivedUser, portMAX_DELAY) == pdTRUE) {
+      // Construct and send the webhook
+      String webhookURL = constructWebhookURL(receivedUser);
+      Serial.println("Sending Webhook: " + webhookURL);
+      sendWebhookHTTPS(webhookURL);
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+// -------------- SEND WEBHOOK (HTTPS) --------------
+void sendWebhookHTTPS(const String &url) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Not connected to WiFi, cannot send webhook.");
+    return;
+  }
+
+  WiFiClientSecure client;
+  // For production, set the CA cert or use certificate pinning
+  client.setInsecure(); // not recommended in real production
+
+  HTTPClient https;
+  if (https.begin(client, url)) {
+    int httpCode = https.GET();
+    if (httpCode > 0) {
+      Serial.printf("[HTTPS] GET... code: %d\n", httpCode);
+      if (httpCode == HTTP_CODE_OK) {
+        String payload = https.getString();
+        Serial.println("Server response: " + payload);
+      }
+    } else {
+      Serial.printf("[HTTPS] GET... failed, error: %s\n", https.errorToString(httpCode).c_str());
+    }
+    https.end();
+  } else {
+    Serial.println("[HTTPS] Unable to connect");
+  }
+}
+
+// -------------- CONSTRUCT WEBHOOK URL --------------
+String constructWebhookURL(const UserData& data) {
+  String url = baseURL + "?";
+  url += "ChildName="     + urlEncode(data.childName);
+  url += "&ParentName="   + urlEncode(data.parentName);
+  url += "&ParentPhone="  + urlEncode(data.phoneNumber);
+  url += "&StudentNumber="+ urlEncode(data.studentNumber);
+  url += "&CardUID="      + urlEncode(data.cardUID);
+  return url;
+}
+
+// -------------- URL ENCODE --------------
+String urlEncode(const String& input) {
+  String encoded;
+  for (size_t i = 0; i < input.length(); i++) {
+    char c = input[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += c;
+    }
+    else if (c == ' ') {
+      encoded += "%20";
+    }
+    else if (c == '+') {
+      encoded += "%2B";
+    }
+    else {
+      char buf[4];
+      sprintf(buf, "%%%02X", (unsigned char)c);
+      encoded += buf;
+    }
+  }
+  return encoded;
+}
+
+// -------------- RFID HELPERS --------------
+#define MAX_RETRIES 3
+
+String readBlock(byte block, MFRC522::MIFARE_Key key) {
+  byte retry = MAX_RETRIES;
+  byte buffer[18];
+  byte len = 18;
+
+  while (retry--) {
+    MFRC522::StatusCode status = mfrc522.PCD_Authenticate(
+      MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(mfrc522.uid));
+      
+    if (status != MFRC522::STATUS_OK) {
+      Serial.print(F("Auth failed Block "));
+      Serial.print(block);
+      Serial.print(": ");
+      Serial.println(mfrc522.GetStatusCodeName(status));
+      continue;
+    }
+
+    status = mfrc522.MIFARE_Read(block, buffer, &len);
+    if (status == MFRC522::STATUS_OK) {
+      return parseData(buffer);
+    }
+  }
+  return "";
+}
+
+String parseData(byte* buffer) {
+  String result = "";
+  for (uint8_t i = 0; i < 16; i++) {
+    if (buffer[i] == 0 || buffer[i] == ' ') break;
+    result += (char)buffer[i];
+  }
+  result.trim();
+  return result;
+}
+
+String getRFIDUID() {
+  String uidString;
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    if (mfrc522.uid.uidByte[i] < 0x10) uidString += "0";
+    uidString += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  return uidString;
+}
+
+// -------------- MP3 + BLUETOOTH AUDIO --------------
+
+// Start playing the specified MP3 from SD
+void playMP3FromSD(const String &filename) {
+  stopMP3(); // Stop any existing playback
+
+  mp3File = SD.open(filename.c_str(), FILE_READ);
+  if (!mp3File) {
+    Serial.println("Could not open MP3 file. Check filename/path!");
+    return;
+  }
+  Serial.print("Playing MP3: ");
+  Serial.println(filename);
+  isPlaying = true;
+}
+
+// Stop playback
+void stopMP3() {
+  if (isPlaying) {
+    mp3File.close();
+    isPlaying = false;
+  }
+}
+
+// A2DP source callback: library calls this to get PCM data
+void processMP3Data(const uint8_t *data, uint32_t len) {
+  // 'data' and 'len' are often used if we do push vs pull,
+  // but with pschatzmann's library in source mode, we typically
+  // feed PCM frames with a2dp_source.write_data().
+
+  if (!isPlaying) {
+    // Output silence
+    a2dp_source.write_data(nullptr, 0);
+    return;
+  }
+
+  // Example Helix decode logic (pseudocode):
+  // 1) Read raw MP3 data from mp3File
+  // 2) Decode to a PCM buffer
+  // 3) Send PCM to A2DP with a2dp_source.write_data()
+
+  static uint8_t mp3Buf[1024];
+  static int16_t pcmBuf[1152 * 2]; // max stereo samples
+  size_t bytesRead = mp3File.read(mp3Buf, sizeof(mp3Buf));
+  if (bytesRead == 0) {
+    // End of file
+    stopMP3();
+    a2dp_source.write_data(nullptr, 0);
+    return;
+  }
+
+  // decodeMP3Helix(...) // <--- integrate your Helix decode calls
+  int samplesDecoded = 0; // e.g. decodeMP3Helix(mp3Buf, bytesRead, pcmBuf, ...)
+
+  // If successful, samplesDecoded is # of stereo frames
+  if (samplesDecoded > 0) {
+    size_t bytesToSend = samplesDecoded * 4; // 2 bytes * 2 channels
+    a2dp_source.write_data((const uint8_t*)pcmBuf, bytesToSend);
+  } else {
+    // No data or decode error => send silence
+    a2dp_source.write_data(nullptr, 0);
+  }
+}
