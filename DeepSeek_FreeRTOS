@@ -1,0 +1,187 @@
+#include <MFRC522.h>
+#include <SD.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include "esp_bt.h"
+#include "BluetoothA2DPSource.h"
+#include <helix_mp3_decoder.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+
+// FreeRTOS Configuration
+#define TASK_STACK_SIZE 4096
+QueueHandle_t rfidQueue, audioQueue;
+SemaphoreHandle_t sdMutex, volumeMutex;
+
+// Task Handles
+TaskHandle_t rfidTaskHandle, audioTaskHandle, volumeTaskHandle, webhookTaskHandle, wifiTaskHandle;
+
+// Shared Resources
+volatile float currentVolume = 1.0;
+UserData currentUserData;
+
+void setup() {
+  Serial.begin(115200);
+  initHardware();
+  initWiFi();
+  initBluetooth();
+  
+  // Create RTOS resources
+  rfidQueue = xQueueCreate(3, sizeof(UserData));
+  audioQueue = xQueueCreate(3, sizeof(String));
+  sdMutex = xSemaphoreCreateMutex();
+  volumeMutex = xSemaphoreCreateMutex();
+
+  // Create tasks
+  xTaskCreatePinnedToCore(
+    rfidTask,        // Task function
+    "RFID",          // Task name
+    TASK_STACK_SIZE, // Stack size
+    NULL,            // Parameters
+    3,               // Priority
+    &rfidTaskHandle, // Task handle
+    0                // Core 0
+  );
+
+  xTaskCreatePinnedToCore(
+    audioTask,
+    "Audio",
+    TASK_STACK_SIZE,
+    NULL,
+    4,  // Higher priority for audio
+    &audioTaskHandle,
+    1   // Core 1
+  );
+
+  xTaskCreatePinnedToCore(
+    volumeTask,
+    "Volume",
+    2048,
+    NULL,
+    1,
+    &volumeTaskHandle,
+    0
+  );
+
+  xTaskCreatePinnedToCore(
+    webhookTask,
+    "Webhook",
+    TASK_STACK_SIZE,
+    NULL,
+    2,
+    &webhookTaskHandle,
+    0
+  );
+
+  xTaskCreatePinnedToCore(
+    wifiTask,
+    "WiFi",
+    2048,
+    NULL,
+    1,
+    &wifiTaskHandle,
+    0
+  );
+
+  vTaskDelete(NULL); // Delete setup task
+}
+
+void loop() {} // FreeRTOS scheduler takes over
+
+// RFID Task (Core 0)
+void rfidTask(void *pvParameters) {
+  while(1) {
+    if(mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      UserData newData = readCardData();
+      
+      // Send to audio and webhook tasks
+      xQueueSend(rfidQueue, &newData, portMAX_DELAY);
+      String filename = "/" + newData.studentNumber + ".mp3";
+      xQueueSend(audioQueue, &filename, portMAX_DELAY);
+      
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// Audio Task (Core 1)
+void audioTask(void *pvParameters) {
+  String filename;
+  while(1) {
+    if(xQueueReceive(audioQueue, &filename, portMAX_DELAY) == pdPASS) {
+      xSemaphoreTake(sdMutex, portMAX_DELAY);
+      playMP3(filename);
+      xSemaphoreGive(sdMutex);
+    }
+    // Audio streaming handled in callback
+  }
+}
+
+// Volume Control Task
+void volumeTask(void *pvParameters) {
+  while(1) {
+    int raw = analogRead(VOLUME_PIN);
+    float newVol = map(raw, 0, 4095, 0, 100) / 100.0;
+    
+    xSemaphoreTake(volumeMutex, portMAX_DELAY);
+    currentVolume = newVol;
+    xSemaphoreGive(volumeMutex);
+    
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+}
+
+// Webhook Task
+void webhookTask(void *pvParameters) {
+  while(1) {
+    UserData data;
+    if(xQueueReceive(rfidQueue, &data, portMAX_DELAY) == pdPASS) {
+      xSemaphoreTake(sdMutex, portMAX_DELAY);
+      sendWebhook(data);
+      xSemaphoreGive(sdMutex);
+    }
+  }
+}
+
+// WiFi Management Task
+void wifiTask(void *pvParameters) {
+  while(1) {
+    if(WiFi.status() != WL_CONNECTED) {
+      connectWiFi();
+    }
+    vTaskDelay(pdMS_TO_TICKS(5000));
+  }
+}
+
+// Audio Callback with Volume Control
+void read_data_callback(const uint8_t *data, uint32_t len) {
+  static size_t mp3_offset = 0;
+  if(xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if(current_mp3_file.available()) {
+      size_t bytes_read = current_mp3_file.read(audio_buffer, audio_buffer_size);
+      size_t pcm_size = mp3_decoder.decode(audio_buffer, bytes_read);
+      
+      // Apply volume with mutex protection
+      xSemaphoreTake(volumeMutex, portMAX_DELAY);
+      float vol = currentVolume;
+      xSemaphoreGive(volumeMutex);
+      
+      for(int i=0; i<pcm_size; i+=2) {
+        int16_t sample = (audio_buffer[i+1] << 8) | audio_buffer[i];
+        sample *= vol;
+        audio_buffer[i] = sample & 0xFF;
+        audio_buffer[i+1] = (sample >> 8) & 0xFF;
+      }
+      
+      a2dp_source.write_data(audio_buffer, pcm_size);
+    }
+    xSemaphoreGive(sdMutex);
+  }
+}
+
+// Keep existing helper functions (playMP3, readCardData, sendWebhook, etc.)
+// with SD card access wrapped in mutexes
